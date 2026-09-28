@@ -333,32 +333,46 @@ events:
   - agent:start
   - agent:end
   - session:start
+  - session:end
 `
 
 const HANDLER_PY = `"""
 Mission Control hook for Hermes Agent.
-Reports session telemetry to the MC /api/sessions endpoint.
+Reports session/agent lifecycle events to the MC /api/hermes/events endpoint.
+
+Uses only the standard library: Hermes' bundled Python does not ship httpx.
 
 Configuration (via ~/.hermes/.env or environment):
   MC_URL      - Mission Control base URL (default: http://localhost:3000)
   MC_API_KEY  - API key for authentication (optional)
 """
 
-import os
+import asyncio
+import json
 import logging
+import os
+import urllib.request
 from datetime import datetime, timezone
 
 logger = logging.getLogger("hooks.mission-control")
 
-MC_URL = os.environ.get("MC_URL", "http://localhost:3000")
-MC_API_KEY = os.environ.get("MC_API_KEY", "")
+EVENTS = {"agent:start", "agent:end", "session:start", "session:end"}
 
 
-def _headers():
-    h = {"Content-Type": "application/json"}
-    if MC_API_KEY:
-        h["X-Api-Key"] = MC_API_KEY
-    return h
+def _post(data: dict) -> None:
+    mc_url = os.environ.get("MC_URL", "http://localhost:3000").rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("MC_API_KEY", "")
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    req = urllib.request.Request(
+        f"{mc_url}/api/hermes/events",
+        data=json.dumps(data).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
+        resp.read()
 
 
 async def handle(event_name: str, payload: dict) -> None:
@@ -366,59 +380,20 @@ async def handle(event_name: str, payload: dict) -> None:
     Called by the Hermes hook registry on matching events.
     Fire-and-forget with a short timeout — never blocks the agent.
     """
-    try:
-        import httpx
-    except ImportError:
-        logger.debug("httpx not available, skipping MC telemetry")
+    if event_name not in EVENTS:
         return
-
-    try:
-        if event_name == "agent:start":
-            await _report_agent_start(payload)
-        elif event_name == "agent:end":
-            await _report_agent_end(payload)
-        elif event_name == "session:start":
-            await _report_session_start(payload)
-    except Exception as exc:
-        logger.debug("MC hook error (%s): %s", event_name, exc)
-
-
-async def _report_agent_start(payload: dict) -> None:
-    import httpx
-
+    payload = payload or {}
     data = {
-        "name": payload.get("agent_name", "hermes"),
-        "role": "Hermes Agent",
-        "status": "active",
-        "source": "hermes-hook",
-    }
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        await client.post(f"{MC_URL}/api/agents", json=data, headers=_headers())
-
-
-async def _report_agent_end(payload: dict) -> None:
-    import httpx
-
-    data = {
-        "name": payload.get("agent_name", "hermes"),
-        "status": "idle",
-        "source": "hermes-hook",
-    }
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        await client.post(f"{MC_URL}/api/agents", json=data, headers=_headers())
-
-
-async def _report_session_start(payload: dict) -> None:
-    import httpx
-
-    data = {
-        "event": "session:start",
+        "event": event_name,
         "session_id": payload.get("session_id", ""),
-        "source": payload.get("source", "cli"),
+        "source": payload.get("platform") or payload.get("source") or "cli",
+        "agent_name": payload.get("agent_name", "hermes"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        await client.post(f"{MC_URL}/api/hermes/events", json=data, headers=_headers())
+    try:
+        await asyncio.to_thread(_post, data)
+    except Exception as exc:
+        logger.debug("MC hook error (%s): %s", event_name, exc)
 `
 
 export const dynamic = 'force-dynamic'
